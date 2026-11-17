@@ -1,0 +1,162 @@
+# SecureCRT Bridge
+
+让 AI 使用你已经登录的 SecureCRT SSH 标签页。你继续使用原来的终端，AI 通过本机接口读取屏幕、发送命令并获取结果；命令和输出也会出现在同一个窗口里。
+
+适合由堡垒机客户端唤起 SecureCRT 的工作流。无需把远程密码交给 AI，也无需另外建立 SSH 连接。
+
+## 能做什么
+
+- **共用终端**：保留 SecureCRT 界面和原登录链路，支持读取屏幕、执行 POSIX shell 命令、获取输出和退出码。
+- **后台多会话**：窗口可最小化；每个标签页有独立 ID，不同标签页可以并行，同一标签页的 AI 写入串行处理。
+- **自动接入**：安装后配置登录钩子；新连接、重新连接时自动接入。本地服务可随 Windows 登录启动。
+- **标准安装向导**：NSIS 提供欢迎页、目录选择、SecureCRT 配置、Skill 选择、安装进度和完成页，支持升级及标准卸载。
+- **会话内一次批准**：专用控制台入口固定目标终端，复用首次批准的进程连续收发命令，任务结束即关闭。
+- **多 Agent Skill 安装**：自动检测本机客户端，默认勾选已发现的 Agent；可多选、修改目录、添加其他客户端或全部跳过。
+- **可暂停、可恢复**：托盘控制暂停与退出，安装前备份配置，卸载按记录恢复，保留用户后续修改。
+- **自主恢复续行输入**：AI 可对自己结果未知的任务发送 Ctrl+C，读屏确认恢复后继续操作，无需默认让用户按键。
+
+## 下载与安装
+
+安装包名为 `SecureCRTBridge-0.1.12-Setup.exe`；公开发布的版本可在 [Releases](https://github.com/IDLE3069/securecrt-bridge/releases) 查看。安装器允许安装所选新版或旧版，不以卸载信息中的 `DisplayVersion` 阻止安装；已发布的旧安装包仍使用其原有检查逻辑。
+
+1. 关闭 SecureCRT。
+2. 双击安装包，按“下一步”选择桥接程序的 **安装目录**，再确认 **SecureCRT 程序** 和 **配置目录**。配置目录应包含 `Sessions/Default.ini`。
+3. **安装 AI Skill** 页默认勾选已检测到的客户端，目录可修改；下一页可逐行填写额外的 Skill 子目录，或用“添加目录…”选择客户端的 `skills` 父目录。全部取消且无额外目录即跳过。
+4. 点击“安装”，查看进度和详细日志，成功后点击“完成”。
+5. 像平常一样从堡垒机连接 SSH，或打开 SecureCRT 会话。
+
+要求：**Windows x64、SecureCRT x64**。已在 SecureCRT 9.7.1 上验证。产品由 Rust 编译，安装 EXE 内置接入 DLL，无需另装 Python、Node 或 Rust。SecureCRT 本身不包含在安装包中。
+
+桥接程序默认安装到 `%LOCALAPPDATA%\Programs\SecureCRTBridge`，可浏览修改；升级沿用旧版位置。数据与备份位于 `%USERPROFILE%\AppData\Local\SecureCRTBridge`。注册与启动项属于当前用户，安装目录需要当前用户有写权限，不会自动提升权限。
+
+升级时重新运行新版安装包。已有版本会显示升级／卸载选择页，也可从 Windows 已安装应用运行 `Uninstall.exe`。标准卸载器在临时目录执行清理，避免程序自身被占用；原始配置备份会保留。
+
+## 使用
+
+AI 加载 [skill](assets/skill/SKILL.md) 后，会先列出会话、核对屏幕与目标，再申请写入租约。也可以直接使用 CLI：
+
+```powershell
+$install = Get-Content "$env:USERPROFILE\AppData\Local\SecureCRTBridge\installation.json" -Raw | ConvertFrom-Json
+$scb = Join-Path $install.install_dir 'securecrt-bridge.exe'
+
+& $scb sessions | Out-String
+& $scb screen SESSION_ID | Out-String
+& $scb claim SESSION_ID --owner my-task | Out-String
+& $scb exec SESSION_ID --owner my-task --command 'hostname; pwd' --timeout 15 | Out-String
+& $scb release SESSION_ID --owner my-task | Out-String
+```
+
+独立 CLI 调用在 PowerShell 中建议接 `| Out-String`，确保等待结束并收集输出。复杂命令用 `--file UTF8_FILE` 或 `--stdin`，避免多层引号转义。
+
+连续工作优先使用 `securecrt-session.exe SESSION_ID --owner CHAT_ID`。首次批准后保留进程，后续通过 stdin 发送 JSON 行，如 `{"op":"exec","command":"hostname","timeout":15}`，再用 `{"op":"result","request_id":"返回的ID"}` 获取结果，完成后发送 `{"op":"close"}`。此模式不要接 `Out-String`。通道固定目标与所有者，不修改全局审批规则；参见 [审批配置](docs/APPROVALS.md)。
+
+`exec` 要求终端处于空闲的 POSIX shell 提示符。命令在 `sh -c` 子 shell 中运行，不改变父 shell 的目录或环境；需要目录上下文时写成 `cd /path && ...`。交互式程序可用 `input`，但它只发送输入，不自动判断执行完成。
+
+### 恢复未完成的 shell 输入
+
+若自己的任务因输入冲突停在续行提示符 `>`，普通 `input` 会被未知任务锁阻止。0.1.6 提供专门的恢复入口：
+
+```powershell
+& $scb claim SESSION_ID --owner my-task | Out-String
+& $scb interrupt SESSION_ID --owner my-task --job ORIGINAL_REQUEST_ID | Out-String
+& $scb screen SESSION_ID | Out-String
+# 等待新的屏幕快照并确认普通 shell 提示符后，再解除原任务锁。
+& $scb acknowledge SESSION_ID --owner my-task | Out-String
+```
+
+恢复请求只能发送一次 Ctrl+C，不接受任意恢复命令，也不会自动重跑原命令。它要求同一租约所有者、匹配的未知任务 ID 和已回到轮询状态的引擎；不会抢占正在运行的输出采集。返回 `sent` 只表示按键已发送，需要核对新的屏幕内容。
+
+### 本机错误日志
+
+运行记录位于 `%LOCALAPPDATA%\SecureCRTBridge\diagnostics.log`，上一段记录保留为 `diagnostics.log.1`。0.1.10 起，记录包含毫秒时间戳、进程、版本、引擎标识及执行阶段；终端注册与命令异常还带有 actor／请求标识。排查脚本解析失败时可检查 `entry.*` 和 `previous.*` 阶段；COM 调用异常会保留宿主提供的错误描述。
+
+若 Windows 在 DLL 加载前就拒绝创建引擎，插件无法写入启动日志，仍需结合 `doctor` 的注册信息和 SecureCRT 弹窗排查。日志可能含宿主异常描述及本机路径，对外分享前请检查内容。
+
+### AI 客户端与审批
+
+安装器检查当前用户的配置目录、指定环境变量和 PATH 中的客户端入口；仅做路径探测，不启动 Agent、不读取登录凭据。检测到的客户端默认勾选，历史安装目录也会保留在列表中。未检测到的客户端不默认创建目录，但可以手动勾选。
+
+| 客户端 | 默认 Skill 文件 |
+|---|---|
+| Codex | `$CODEX_HOME/skills/securecrt-bridge/SKILL.md`，未设置时 `~/.codex/skills/securecrt-bridge/SKILL.md` |
+| DeepSeek Harness | `$DSH_HOME/skills/securecrt-bridge/SKILL.md`，未设置时 `~/.dsh/skills/securecrt-bridge/SKILL.md` |
+| Claude Code | `$CLAUDE_CONFIG_DIR/skills/securecrt-bridge/SKILL.md`，未设置时 `~/.claude/skills/securecrt-bridge/SKILL.md` |
+| Cursor | `~/.cursor/skills/securecrt-bridge/SKILL.md` |
+| GitHub Copilot | `~/.copilot/skills/securecrt-bridge/SKILL.md` |
+| Gemini CLI | `~/.gemini/skills/securecrt-bridge/SKILL.md` |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/skills/securecrt-bridge/SKILL.md`，未设置时 `~/.config/opencode/skills/securecrt-bridge/SKILL.md` |
+
+`~` 表示当前 Windows 用户目录。列表及安装日志展示完整路径；选中一行后可修改目录。“其他客户端 / 添加目录…”支持多个自定义位置，选择客户端的 `skills` 父目录即可，安装器添加 `securecrt-bridge` 子目录。相同路径去重。
+
+取消全部勾选且清空额外目录会跳过 Skill。升级时，取消选择的旧 Skill 仅在仍与本程序安装内容一致时移除，用户修改会保留并记录。卸载按所有实际安装目录清理，不删除客户端本身或其他 Skill。
+
+不要求所有 Agent 都采用相同配置；自动检测覆盖表中客户端，其他 Agent、项目级安装或自定义加载规则需手动选择路径。各客户端仍需启用本地 Skill 加载并允许本地命令工具，目录安装不代表已验证每个客户端的运行兼容性。参见 [客户端目录依据](docs/AGENT_SKILLS.md)。
+
+命令行安装默认自动选择。`--skills none` 跳过，或重复传入 `--skill-dir C:/Agent/skills/securecrt-bridge` 指定准确的 Skill 子目录。`detect` 的 `skill_clients` 字段返回检测结果。
+
+只读查询可配置持久允许规则；远程写入按具体操作和已有授权范围处理。skill 会复用同一任务内已授权的操作，不要求每次查询都重新确认。宿主沙箱和审批规则仍然生效，具体配置及边界见 [审批配置](docs/APPROVALS.md)。
+
+## 技术方案
+
+```mermaid
+flowchart TB
+    U["用户"] <-->|"操作和查看"| UI
+    subgraph CRT["SecureCRT 进程"]
+        UI["原有终端界面"]
+        T["原有 SSH 会话"]
+        D["Rust COM 引擎 DLL"]
+        UI <-->|"输入与显示"| T
+        D <-->|"调用内置终端读写方法"| T
+    end
+    T <-->|"SSH"| S["远程服务器"]
+    A["AI / CLI"] <-->|"HTTP + JSON"| B["Rust Broker"]
+    D <-->|"轮询任务、回传结果"| B
+```
+
+- **Native engine**：实现 Active Scripting COM 接口，使用独立 ProgID `SecureCRTBridge.Native`。SecureCRT 登录脚本载入它后，保留 `crt.GetScriptTab()` 的实际标签页对象；终端调用始终留在宿主脚本线程。
+- **Broker**：仅监听 `127.0.0.1`，为每个标签页维护状态、写入租约和请求 ID。AI 可并行使用不同会话，不依赖窗口焦点或标签页顺序。
+- **通信与轮询**：HTTP/1.1 + UTF-8 JSON，使用 Bearer 令牌。空闲 DLL 约每 200ms 上报屏幕并领取任务；CLI 默认约每 150ms 查询任务结果。DLL 通过进程内方法访问 SecureCRT，不额外运行一层 VBScript/Python。
+- **结果采集**：把命令包在开始／结束标记之间，使用 `Screen.ReadString` 获取输出和退出码。标记在发送字符串中拆开，避免误匹配终端命令回显。
+- **显示处理**：空闲时关闭同步缓冲，让用户窗口持续刷新；采集期间使用同步读取，所有退出路径恢复显示。
+- **安装器**：原生 Win32 控件加工作线程。文件写入、配置备份、COM 注册、启动项设置和服务启动通过进度事件更新窗口。
+- **恢复记录**：记录修改前后的配置值和自有文件哈希；卸载只还原仍保持安装值的条目，保留用户修改过的文件与配置。
+
+目录：
+
+```text
+crates/core     HTTP、会话调度、租约、请求去重、配置备份与恢复
+crates/engine   Active Scripting COM 引擎与终端采集
+crates/app      安装界面、服务、CLI、托盘、隔离诊断程序
+assets/skill    AI 使用说明
+```
+
+## 边界与可靠性
+
+- 这是**同一个终端**，用户键盘输入不会被租约锁住。人和 AI 应轮流操作同一标签页。
+- 本机令牌保护所有 API；拒绝带 Origin 的浏览器请求。令牌不提供隔离同一 Windows 用户下恶意程序的能力。不要分享或提交 `connection.json`。
+- 每次写入先生成请求 ID。超时或断线时先查询 `result REQUEST_ID`，不得凭超时判断“没执行”并重发。
+- 请求去重与结果记录属于当前服务生命周期，不是跨重启的 exactly-once 保证。未知结果会保持会话占用，确认 shell 已空闲后才能 `acknowledge`。
+- 命令最多等待 300 秒，结果上限 1 MiB；普通历史输出约 30 分钟后清理，未确认的未知结果需显式处理。暂停取消未派发任务，不会中断已经在服务器运行的命令。
+- 0.1.6 增加自主恢复：若自己的未知任务停在 shell 续行提示符，续租后运行 `interrupt SESSION_ID --owner CHAT_ID --job ORIGINAL_REQUEST_ID` 发送一次 Ctrl+C；查询恢复任务并读取新的屏幕快照，确认普通提示符后再 `acknowledge`。普通输入仍受锁保护，不能中断其他对话或尚在采集输出的任务。
+- 现有内置 Python 或不支持的登录脚本会跳过，保留原设置。ActiveX 脚本串联已实现，但尚未覆盖第三方脚本实测。显式 `/SCRIPT` 启动参数会覆盖默认登录钩子。
+- 安装器不会绕过堡垒机认证、SecureCRT 许可或 AI 所在环境的权限限制。
+
+## 构建与测试
+
+推荐 Windows x64 Rust MSVC 工具链及 Visual Studio C++ Build Tools：
+
+```powershell
+.\build.ps1 test
+.\build.ps1 release
+.\package.ps1 -NsisPath 'C:\Tools\NSIS\makensis.exe'
+```
+
+先构建 DLL 和会话控制台，再内嵌进桥接 EXE；`package.ps1` 使用现有 NSIS 3 编译器生成 `dist/SecureCRTBridge-版本-Setup.exe`。可复用其他项目（如 shishi）的编译器，无需重复安装。使用锁定依赖；已有缓存可加 `-Offline`。MSVC 和 GNU 均静态链接 CRT。
+
+GNU 工具链需要 MinGW 的 `windres`、`dlltool`、`as` 与链接器。非标准路径可传 `-ToolchainRoot <Rust工具链目录> -BinutilsDirectory <MinGW的bin目录>`。这些工具仅用于开发，不是用户运行依赖。
+
+自动测试覆盖认证 HTTP、分段网络请求、租约隔离、重复派发防护、超时保留、配置选择性恢复、COM 生命周期及延时输出。真实会话验证与安装器验证范围见 [验证记录](docs/VALIDATION.md)。
+
+## 许可
+
+Copyright (c) 2026 IDLE。本项目采用 [GNU Affero General Public License v3.0（AGPL-3.0-only）](LICENSE) 开源协议。本项目与 VanDyke Software、齐治均无隶属关系，不分发 SecureCRT 或堡垒机客户端。依赖说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
